@@ -16,6 +16,9 @@ pub trait Executor: Send + Sync {
     /// Run user code and return its result + captured stdout/stderr.
     async fn run(&self, code: String) -> Result<RunOutput, Error>;
 
+    /// Replace the worker's preloaded SDK with `sdk_py` (no restart).
+    async fn reload_sdk(&self, sdk_py: &str) -> Result<(), Error>;
+
     /// Gracefully stop the backend.
     async fn shutdown(&self);
 }

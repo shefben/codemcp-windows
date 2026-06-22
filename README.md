@@ -48,7 +48,66 @@ Working vertical slice over **stdio** and **Streamable HTTP**:
 Isolation backends beyond the host process (Docker, Monty) and optional LLM tool
 summaries are planned — see [TODO](#todo--planned-work).
 
+## Install
+
+### One-line install (prebuilt binary)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh | sh
+```
+
+This downloads a prebuilt binary for your OS/arch from
+[GitHub Releases](https://github.com/basedatum/codemcp/releases), verifies its
+SHA-256 checksum, and installs it to `~/.local/bin` (or `/usr/local/bin`).
+Supported platforms: macOS (arm64, x86_64) and Linux (arm64, x86_64).
+
+Useful overrides:
+
+```sh
+# pin a version and/or choose the install dir
+curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh \
+  | CODEMCP_VERSION=v0.1.0 CODEMCP_BIN_DIR="$HOME/bin" sh
+```
+
+| Variable          | Purpose                                            |
+| ----------------- | -------------------------------------------------- |
+| `CODEMCP_VERSION` | Release tag to install (default: latest)           |
+| `CODEMCP_BIN_DIR` | Install directory                                  |
+| `CODEMCP_REPO`    | `owner/repo` to download from (default `basedatum/codemcp`) |
+
+> opencode launches `codemcp` by bare name, so the install dir must be on your
+> `PATH`. The installer prints the exact line to add if it isn't.
+
+### Build from source
+
+Requires a Rust toolchain.
+
+```sh
+make install                 # release build, install onto PATH (/usr/local/bin)
+make install PREFIX=~/.local # install somewhere else
+make uninstall               # remove it
+make help                    # list all targets
+```
+
+Or with cargo directly: `cargo install --path .`.
+
 ## Quick start
+
+### Set up from an existing harness (opencode)
+
+If you already have MCP servers configured in opencode, let codemcp adopt them:
+
+```bash
+codemcp setup opencode
+```
+
+This backs up `~/.config/opencode/opencode.json`, **moves its `mcp` section
+verbatim** into codemcp's `mcp.json`, and rewrites opencode to launch a single
+`codemcp` server instead of all the individual ones. Restart opencode afterward.
+(`codemcp` must be on your `PATH`, since opencode launches it by bare name.) Only
+`opencode` is supported today; more harnesses can be added later.
+
+### Or configure manually
 
 1. Write a config at `~/.config/codemcp/mcp.json` (XDG; override with
    `CODEMCP_CONFIG`). The format is a subset of opencode's `mcp` object:
@@ -91,6 +150,44 @@ summaries are planned — see [TODO](#todo--planned-work).
    ```bash
    CODEMCP_DUMP=1 codemcp
    ```
+
+## Enabling/disabling upstreams at runtime
+
+`mcp.json` is the **boot-time** desired state. While the gateway is running you
+can connect or disconnect upstreams **without restarting it** using the admin
+subcommands, which talk to the running gateway over its Unix admin socket:
+
+```bash
+codemcp list                 # show every configured server + live status
+codemcp enable github        # connect 'github' now (runtime only)
+codemcp disable github       # disconnect 'github' now (runtime only)
+```
+
+```
+NAME                   TYPE    DEFAULT   CONNECTED  TOOLS
+github                 local   yes       yes        45
+brave                  local   no        no         0
+```
+
+- `DEFAULT` = the `enabled` flag in `mcp.json` (what connects at boot).
+- `CONNECTED` = whether it is connected in the running process right now.
+
+By default admin commands change **only the live process** and do **not** touch
+`mcp.json`. To also persist the change as the new boot default, pass
+`--make-default`:
+
+```bash
+codemcp enable brave --make-default    # connect now AND set enabled:true in mcp.json
+codemcp disable github --make-default  # disconnect now AND set enabled:false in mcp.json
+```
+
+When an upstream is enabled/disabled, codemcp regenerates the Python SDK,
+hot-reloads it into the running worker (no worker restart, no lost state), and
+sends a `notifications/tools/list_changed` to connected MCP clients so they
+re-read the updated `execute_python` description.
+
+> Note: `--make-default` rewrites `mcp.json` (preserving all values) and may
+> reorder keys alphabetically.
 
 ## How it works
 
@@ -140,6 +237,7 @@ All settings are read once at startup from `CODEMCP_*` environment variables.
 | `CODEMCP_CONFIG` | `~/.config/codemcp/mcp.json` | Path to the upstream `mcp.json`. |
 | `CODEMCP_ISOLATION` | `HOST_SYSTEM` | Execution isolation: `HOST_SYSTEM`, `DOCKER`, `MONTY`. Only `HOST_SYSTEM` is implemented today. |
 | `CODEMCP_TRANSPORT` | `stdio` | Downstream MCP transport: `stdio` or `http`. |
+| `CODEMCP_ADMIN_SOCKET` | `~/.config/codemcp/admin.sock` | Unix socket for the admin CLI (`list`/`enable`/`disable`). Both the gateway and the CLI honor it. |
 | `CODEMCP_LOG` | `info` | Tracing filter (e.g. `info`, `debug`, `codemcp=debug`). |
 | `CODEMCP_PYTHON` | _(auto)_ | Path to the Python interpreter (defaults to `python3`/`python` on `PATH`). |
 

@@ -18,7 +18,7 @@ use crate::error::Error;
 pub type UpstreamService = RunningService<RoleClient, ()>;
 
 /// Connect to the upstream described by `spec`.
-pub async fn connect(name: &str, spec: &ServerSpec) -> Result<UpstreamService, Error> {
+pub(crate) async fn connect(name: &str, spec: &ServerSpec) -> Result<UpstreamService, Error> {
     match spec {
         ServerSpec::Local {
             command,

@@ -65,7 +65,10 @@ impl SdkRegistry {
         Self { bindings, route }
     }
 
-    /// Resolve a Python fn name back to (server, tool).
+    /// Resolve a Python fn name back to (server, tool). Routing currently happens
+    /// directly via the (server, tool) baked into `sdk.py`, so this is retained
+    /// for diagnostics/tests.
+    #[allow(dead_code)]
     pub fn resolve(&self, fn_name: &str) -> Option<&(String, String)> {
         self.route.get(fn_name)
     }

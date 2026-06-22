@@ -191,6 +191,25 @@ def _json_safe(value):
         return repr(value)
 
 
+class SdkHolder:
+    """Mutable container for the current SDK module so `reload` can swap it."""
+
+    def __init__(self, module, sdk_dir):
+        self.module = module
+        self.sdk_dir = sdk_dir
+
+    def reload(self, source):
+        """Overwrite sdk.py with `source` and re-import the module."""
+        import importlib
+
+        path = os.path.join(self.sdk_dir, "sdk.py")
+        with open(path, "w") as f:
+            f.write(source)
+        # Drop any cached bytecode so the new source is used.
+        importlib.invalidate_caches()
+        self.module = importlib.reload(self.module)
+
+
 async def main():
     url = os.environ["CODEMCP_CONTROL_URL"]
     token = os.environ["CODEMCP_CONTROL_TOKEN"]
@@ -200,6 +219,7 @@ async def main():
         sys.path.insert(0, sdk_dir)
     import sdk as sdk_module  # generated
 
+    holder = SdkHolder(sdk_module, sdk_dir)
     loop = asyncio.get_running_loop()
 
     async with websockets.connect(url, max_size=None) as ws:
@@ -218,18 +238,36 @@ async def main():
             if method == "run":
                 # Run user code as a background task so the read loop keeps
                 # servicing the SDK's call_tool round-trips while it executes.
-                asyncio.create_task(_handle_run(ws, msg, sdk_module, dispatcher))
+                asyncio.create_task(_handle_run(ws, msg, holder, dispatcher))
+            elif method == "reload":
+                await _handle_reload(ws, msg, holder)
             elif method is None:
                 # A response to one of our call_tool requests.
                 await dispatcher.handle_response(msg)
 
 
-async def _handle_run(ws, msg, sdk_module, dispatcher):
+async def _handle_reload(ws, msg, holder):
+    rid = msg.get("id")
+    source = msg.get("params", {}).get("sdk", "")
+    error = None
+    try:
+        await asyncio.to_thread(holder.reload, source)
+    except Exception:
+        error = traceback.format_exc()
+    response = {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "result": {"result": None, "stdout": "", "stderr": "", "error": error},
+    }
+    await ws.send(json.dumps(response))
+
+
+async def _handle_run(ws, msg, holder, dispatcher):
     code = msg.get("params", {}).get("code", "")
     rid = msg.get("id")
     # Run user code off the event loop so SDK calls can round-trip.
     result_value, stdout, stderr, error = await asyncio.to_thread(
-        _exec_user_code, code, sdk_module, dispatcher
+        _exec_user_code, code, holder.module, dispatcher
     )
     response = {
         "jsonrpc": "2.0",

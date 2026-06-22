@@ -62,16 +62,25 @@ impl ServerSpec {
     }
 }
 
-/// A resolved (env-interpolated, enabled) upstream server.
+/// A resolved (env-interpolated) upstream server plus its config `enabled` flag.
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub name: String,
     pub spec: ServerSpec,
+    /// Whether this server is `enabled` in the config file (boot state).
+    pub enabled: bool,
 }
 
 /// Load + parse the config file, interpolate `{env:VAR}`, and return only the
-/// enabled servers.
+/// enabled servers (the boot-time set to connect at startup).
 pub fn load(path: &Path) -> Result<Vec<UpstreamConfig>, Error> {
+    Ok(load_all(path)?.into_iter().filter(|c| c.enabled).collect())
+}
+
+/// Load + parse every server in the config file (enabled and disabled), with
+/// `{env:VAR}` interpolated. Used by the admin runtime so a currently-disabled
+/// server can still be connected on demand.
+pub fn load_all(path: &Path) -> Result<Vec<UpstreamConfig>, Error> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         Error::Config(format!("cannot read config {}: {e}", path.display()))
     })?;
@@ -80,14 +89,40 @@ pub fn load(path: &Path) -> Result<Vec<UpstreamConfig>, Error> {
 
     let mut out = Vec::new();
     for (name, mut spec) in std::mem::take(&mut file.mcp) {
-        if !spec.enabled() {
-            tracing::debug!(server = %name, "skipping disabled upstream");
-            continue;
-        }
+        let enabled = spec.enabled();
         interpolate_spec(&mut spec)?;
-        out.push(UpstreamConfig { name, spec });
+        out.push(UpstreamConfig {
+            name,
+            spec,
+            enabled,
+        });
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Persist a server's `enabled` flag back to the config file, preserving all
+/// other content verbatim. Used by admin commands with `--make-default`.
+pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<(), Error> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("cannot read config {}: {e}", path.display())))?;
+    let mut root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| Error::Config(format!("invalid config {}: {e}", path.display())))?;
+
+    let server = root
+        .get_mut("mcp")
+        .and_then(|m| m.as_object_mut())
+        .and_then(|m| m.get_mut(name))
+        .and_then(|s| s.as_object_mut())
+        .ok_or_else(|| Error::Config(format!("server {name:?} not found in {}", path.display())))?;
+    server.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+
+    let mut text = serde_json::to_string_pretty(&root)
+        .map_err(|e| Error::Config(format!("serialize config failed: {e}")))?;
+    text.push('\n');
+    std::fs::write(path, text)
+        .map_err(|e| Error::Config(format!("cannot write config {}: {e}", path.display())))?;
+    Ok(())
 }
 
 fn interpolate_spec(spec: &mut ServerSpec) -> Result<(), Error> {

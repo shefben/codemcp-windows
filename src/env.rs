@@ -116,9 +116,35 @@ where
     Ok(s.split_whitespace().map(String::from).collect())
 }
 
+/// XDG-style config base: `$XDG_CONFIG_HOME`, else `~/.config`.
+///
+/// We deliberately do not use `dirs::config_dir()`: on macOS it returns
+/// `~/Library/Application Support`, but codemcp (and opencode) follow the XDG
+/// convention of `~/.config` on every platform.
+pub fn config_base() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let p = PathBuf::from(xdg);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".config"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn default_config_path() -> PathBuf {
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("codemcp").join("mcp.json")
+    config_base().join("codemcp").join("mcp.json")
+}
+
+impl Settings {
+    /// The codemcp config path used by `setup`: honors `CODEMCP_CONFIG`, else the
+    /// XDG default. Standalone so `setup` need not build full `Settings`.
+    pub fn config_path_for_setup() -> PathBuf {
+        std::env::var_os("CODEMCP_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_config_path)
+    }
 }
 
 fn default_summary_cache() -> PathBuf {

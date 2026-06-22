@@ -403,3 +403,47 @@ description (behind a lock), and the set of captured server `Peer`s.
 - `codemcp list` / `codemcp enable NAME [--make-default]` /
   `codemcp disable NAME [--make-default]` -> connect to the admin socket, send the
   command, print the result.
+
+### Status: [DONE]
+Implemented and verified end-to-end:
+- `config::load_all` (all servers + enabled flag) and `config::set_enabled`
+  (verbatim rewrite for `--make-default`).
+- `UpstreamManager` made interior-mutable (`RwLock`): `connect_one`,
+  `disconnect_one`, `is_connected`, async `all_tools`, non-consuming `shutdown`.
+- `Runtime` (`src/runtime.rs`): shared SDK/description state, boot config map,
+  captured peers; `enable`/`disable`/`list`; `regenerate_and_reload` rebuilds the
+  SDK, calls `Executor::reload_sdk`, swaps state, and fires
+  `notify_tool_list_changed` to live peers.
+- Worker hot-reload: control-channel `reload { sdk }` + `bootstrap.py` `SdkHolder`
+  (`importlib.reload`).
+- Admin Unix socket server (`src/admin.rs`) + clap CLI (`src/cli.rs`):
+  `codemcp list|enable|disable [--make-default]`.
+- Verified: live `enable` grew the `execute_python` description 13->26 fn defs and
+  a tool from the newly-enabled server was immediately callable; `disable
+  --make-default` disconnected and persisted `enabled:false`; error paths (unknown
+  server, no gateway running) are clean.
+
+---
+
+## 11. `setup` command: adopt a harness's MCP config
+
+`codemcp setup <harness>` (only `opencode` for now):
+1. Locate the harness config (XDG: `$XDG_CONFIG_HOME`/`~/.config`, **not**
+   `dirs::config_dir()` which is wrong on macOS).
+2. Back it up (timestamped `.bak.<YYYYMMDD-HHMMSS>`).
+3. Move its `mcp` object **verbatim** into codemcp's `mcp.json`
+   (`CODEMCP_CONFIG` or XDG default), backing up any existing one first.
+4. Rewrite the harness config: replace `mcp` with one `codemcp` local server
+   (command `["codemcp"]`, bare name on PATH; `CODEMCP_CONFIG` env set), and reset
+   `tools` to `codemcp*`/`execute_python`. All other keys (provider, plugin, …)
+   preserved.
+5. Warn if `codemcp` is not on PATH.
+
+### Status: [DONE]
+- `src/setup.rs` (`Harness` enum + `run`), `Settings::config_path_for_setup`,
+  `env::config_base()` (XDG, fixes macOS `dirs::config_dir()` mismatch that also
+  affected the gateway's own default config path), clap `Setup` subcommand routed
+  via `run_local` (no gateway needed).
+- Verified in a sandbox: backup created, `mcp` moved verbatim (deep-equal),
+  opencode rewritten to launch codemcp with provider/plugin preserved, error
+  paths clean (missing config, bad harness).

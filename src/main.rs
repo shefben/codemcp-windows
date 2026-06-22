@@ -2,20 +2,28 @@
 //!
 //! Connects to many upstream MCP servers and exposes a single `execute_python`
 //! tool. Agents write Python that calls all upstream tools as typed functions.
+//!
+//! With no subcommand, runs the gateway. The `list`/`enable`/`disable`
+//! subcommands are an admin client that talks to a running gateway.
 
+mod admin;
+mod cli;
 mod config;
 mod control;
 mod env;
 mod error;
 mod exec;
 mod prompt;
+mod runtime;
 mod sdk;
 mod server;
+mod setup;
 mod upstream;
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::Parser;
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -24,15 +32,32 @@ use rmcp::transport::streamable_http_server::tower::{
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
+use crate::cli::Cli;
 use crate::env::{ServerTransport, Settings};
 use crate::exec::host::HostExecutor;
 use crate::exec::Executor;
+use crate::runtime::{Runtime, SdkState};
 use crate::sdk::SdkRegistry;
 use crate::server::CodeServer;
 use crate::upstream::UpstreamManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if let Some(command) = cli.command {
+        // `setup` runs locally without touching the gateway/admin socket.
+        if command.is_local() {
+            return cli::run_local(command).map_err(Into::into);
+        }
+        // Admin subcommands are a thin client to a running gateway.
+        return cli::run_admin(command).await.map_err(Into::into);
+    }
+
+    run_gateway().await
+}
+
+async fn run_gateway() -> Result<()> {
     let settings = Settings::from_env()?;
 
     tracing_subscriber::fmt()
@@ -51,7 +76,7 @@ async fn main() -> Result<()> {
     tracing::info!(count = configs.len(), "loaded upstream server configs");
 
     let manager = UpstreamManager::connect_all(&configs).await;
-    let tools = manager.all_tools();
+    let tools = manager.all_tools().await;
     tracing::info!(total_tools = tools.len(), "discovered upstream tools");
 
     let registry = SdkRegistry::build(&tools);
@@ -80,16 +105,37 @@ async fn main() -> Result<()> {
             eprintln!("=== error ===\n{err}");
         }
         executor.shutdown().await;
-        if let Ok(m) = Arc::try_unwrap(upstreams) {
-            m.shutdown().await;
-        }
+        upstreams.shutdown().await;
         return Ok(());
     }
 
-    // Start the Python worker, build the SDK description, and serve.
-    let executor = HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?;
+    // Start the Python worker and assemble the shared runtime.
+    let executor: Arc<dyn Executor> =
+        Arc::new(HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?);
     let description = prompt::build_description(&registry, settings.isolation);
-    let code_server = CodeServer::new(Box::new(executor), description);
+    let runtime = Runtime::new(
+        upstreams.clone(),
+        executor,
+        settings.isolation,
+        settings.config.clone(),
+        SdkState {
+            registry,
+            description,
+        },
+    )
+    .await?;
+
+    // Admin socket: enable/disable upstreams at runtime.
+    {
+        let admin_rt = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(e) = admin::serve(admin_rt).await {
+                tracing::error!(error = %e, "admin interface failed");
+            }
+        });
+    }
+
+    let code_server = CodeServer::new(runtime.clone());
 
     match settings.transport {
         ServerTransport::Stdio => {
@@ -128,8 +174,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Ok(m) = Arc::try_unwrap(upstreams) {
-        m.shutdown().await;
-    }
+    runtime.shutdown().await;
     Ok(())
 }

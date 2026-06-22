@@ -105,6 +105,10 @@ impl super::Executor for HostExecutor {
         }
     }
 
+    async fn reload_sdk(&self, sdk_py: &str) -> Result<(), Error> {
+        self.handle.reload(sdk_py).await
+    }
+
     async fn shutdown(&self) {
         // Dropping the child (kill_on_drop) handles teardown.
     }

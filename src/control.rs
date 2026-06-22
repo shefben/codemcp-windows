@@ -72,6 +72,34 @@ impl ControlHandle {
         rx.await
             .map_err(|_| Error::Worker("worker dropped run request".into()))?
     }
+
+    /// Push a new `sdk.py` to the worker and have it re-import + re-inject the
+    /// SDK functions, without restarting the worker. Awaits the worker's ack.
+    pub async fn reload(&self, sdk_py: &str) -> Result<(), Error> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "reload",
+            "params": { "sdk": sdk_py }
+        });
+        self.outbound
+            .send(Message::Text(msg.to_string().into()))
+            .map_err(|_| Error::Worker("worker connection closed".into()))?;
+
+        let out = rx
+            .await
+            .map_err(|_| Error::Worker("worker dropped reload request".into()))??;
+        if let Some(err) = out.error {
+            return Err(Error::Worker(format!("worker reload failed: {err}")));
+        }
+        Ok(())
+    }
 }
 
 /// The control server. Bind first to learn the actual port, then accept one
