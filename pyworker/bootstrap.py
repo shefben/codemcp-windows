@@ -199,12 +199,23 @@ class SdkHolder:
         self.sdk_dir = sdk_dir
 
     def reload(self, source):
-        """Overwrite sdk.py with `source` and re-import the module."""
+        """Overwrite sdk.py with `source` and re-import the module.
+
+        The write is best-effort: on a read-only filesystem (the Docker backend
+        bind-mounts the workdir read-only), the gateway has already updated the
+        mounted file, so we skip the write and just re-import it. On a writable
+        filesystem (HOST backend) the write is what materializes the new SDK.
+        """
         import importlib
 
         path = os.path.join(self.sdk_dir, "sdk.py")
-        with open(path, "w") as f:
-            f.write(source)
+        try:
+            with open(path, "w") as f:
+                f.write(source)
+        except OSError:
+            # Read-only mount: the gateway owns the file and has already
+            # written the new source there. Re-import picks up that content.
+            pass
         # Drop any cached bytecode so the new source is used.
         importlib.invalidate_caches()
         self.module = importlib.reload(self.module)

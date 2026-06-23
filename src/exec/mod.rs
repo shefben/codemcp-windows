@@ -6,6 +6,9 @@
 
 pub mod host;
 
+#[cfg(feature = "docker")]
+pub mod docker;
+
 use async_trait::async_trait;
 
 use crate::control::RunOutput;

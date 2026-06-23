@@ -330,7 +330,21 @@ struct ExecOutput { result: serde_json::Value, stdout: String, stderr: String }
    json-response init + `tools/call execute_python` → `everything_get_sum(15,27)`
    → `{"answer":"...42."}`; stateful SSE init returns `mcp-session-id` + SSE-framed
    response. deps: `axum 0.8`.
-7. [TODO] `exec/docker.rs`. Documented as planned work in `README.md`.
+7. [DONE] `exec/docker.rs` (feature `docker`, default-on; `bollard` Docker API).
+   Runs the worker in a hardened container (`--rm`, cap-drop ALL,
+   no-new-privileges, RO bind-mount of the workdir, attached to a dedicated
+   `codemcp-net` bridge). Reuses `bootstrap.py` + the WS control protocol
+   unchanged. **Platform-aware secure control channel:** native Linux binds the
+   bridge gateway IP (host-internal, not LAN-routed); Docker Desktop
+   (macOS/Windows) binds loopback and the container reaches it via
+   `host.docker.internal` (`--add-host=...:host-gateway`) — never `0.0.0.0`.
+   Auto-pulls the image; pip-installs `websockets` fresh per cold start; workdir
+   under `$HOME/.cache/codemcp/work/<pid>` for Docker Desktop file sharing.
+   Structured limits replace `DOCKER_EXTRA_ARGS`: `CODEMCP_DOCKER_{NETWORK,
+   MEMORY,CPUS,PIDS_LIMIT,READONLY}`. Verified E2E on macOS Docker Desktop:
+   SMOKE `21*2`→42 with stdout, and an `echo` upstream `call_tool` round-trip
+   from inside the container; container auto-removed; control bound to loopback
+   (not 0.0.0.0). Unit tests cover `gateway_of` IPAM parsing.
 8. [TODO] `exec/monty.rs` (feature-gated) + type-check stubs. Documented as
    planned work in `README.md`.
 9. [TODO] Optional LLM summaries + cache. Documented as planned work in

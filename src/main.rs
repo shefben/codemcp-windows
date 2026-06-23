@@ -34,7 +34,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
-use crate::env::{ServerTransport, Settings};
+use crate::env::{Isolation, ServerTransport, Settings};
 use crate::exec::host::HostExecutor;
 use crate::exec::Executor;
 use crate::runtime::{Runtime, SdkState};
@@ -64,6 +64,39 @@ async fn main() -> Result<()> {
     }
 
     run_gateway(None).await
+}
+
+/// Construct the Python execution backend selected by `CODEMCP_ISOLATION`.
+async fn build_executor(
+    settings: &Settings,
+    sdk_py: &str,
+    upstreams: crate::upstream::SharedUpstreams,
+) -> Result<Arc<dyn Executor>> {
+    match settings.isolation {
+        Isolation::HostSystem => {
+            Ok(Arc::new(HostExecutor::start(settings, sdk_py, upstreams).await?))
+        }
+        Isolation::Docker => {
+            #[cfg(feature = "docker")]
+            {
+                Ok(Arc::new(
+                    crate::exec::docker::DockerExecutor::start(settings, sdk_py, upstreams).await?,
+                ))
+            }
+            #[cfg(not(feature = "docker"))]
+            {
+                let _ = (sdk_py, upstreams);
+                anyhow::bail!(
+                    "CODEMCP_ISOLATION=DOCKER but this binary was built without the `docker` feature; rebuild with --features docker"
+                )
+            }
+        }
+        Isolation::Monty => {
+            anyhow::bail!(
+                "CODEMCP_ISOLATION=MONTY is not implemented yet; use HOST_SYSTEM or DOCKER"
+            )
+        }
+    }
 }
 
 /// Run the gateway. When `http_override` is `Some((host, port))` (from
@@ -113,9 +146,9 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     let sdk_py = registry.generate_sdk_py();
     let upstreams = Arc::new(manager);
 
-    // Smoke-test path: start the host worker, run a snippet, print, exit.
+    // Smoke-test path: start the worker, run a snippet, print, exit.
     if let Ok(code) = std::env::var("CODEMCP_SMOKE") {
-        let executor = HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?;
+        let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
         let out = executor.run(code).await?;
         eprintln!("=== result ===\n{}", serde_json::to_string_pretty(&out.result)?);
         eprintln!("=== stdout ===\n{}", out.stdout);
@@ -129,8 +162,7 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     }
 
     // Start the Python worker and assemble the shared runtime.
-    let executor: Arc<dyn Executor> =
-        Arc::new(HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?);
+    let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
     let description = prompt::build_description(&registry, settings.isolation);
     let launcher = launcher::Launcher::detect();
     tracing::info!(

@@ -53,10 +53,22 @@ pub struct Settings {
     pub http_json_response: bool,
 
     pub python: Option<PathBuf>,
+
+    // --- DOCKER isolation ----------------------------------------------------
+    /// Image the Python worker runs in. Any stock python image works.
     pub docker_image: String,
-    /// Whitespace-split via custom deserializer.
-    #[serde(deserialize_with = "de_args")]
-    pub docker_extra_args: Vec<String>,
+    /// User-defined bridge network the worker container attaches to. The control
+    /// channel binds to *this network's* gateway IP only, so it is never exposed
+    /// on the host's LAN interfaces.
+    pub docker_network: String,
+    /// Hard memory limit in bytes (`0` = unlimited).
+    pub docker_memory: i64,
+    /// CPU limit in whole/fractional cores (`0` = unlimited). Mapped to NanoCPUs.
+    pub docker_cpus: f64,
+    /// Max number of processes in the container (`0` = unlimited).
+    pub docker_pids_limit: i64,
+    /// Mount the container root filesystem read-only.
+    pub docker_readonly: bool,
 
     pub control_bind: String,
     pub control_host_for_worker: Option<String>,
@@ -92,7 +104,11 @@ impl Default for Settings {
             http_json_response: false,
             python: None,
             docker_image: "python:3.14-slim".to_string(),
-            docker_extra_args: Vec::new(),
+            docker_network: "codemcp-net".to_string(),
+            docker_memory: 0,
+            docker_cpus: 0.0,
+            docker_pids_limit: 0,
+            docker_readonly: false,
             control_bind: "127.0.0.1:0".to_string(),
             control_host_for_worker: None,
             control_token: None,
@@ -150,6 +166,19 @@ impl Settings {
             .map(PathBuf::from)
             .unwrap_or_else(default_config_path)
     }
+}
+
+/// Directory holding the worker's `bootstrap.py` + `sdk.py` for DOCKER mode.
+///
+/// Unlike the host executor (which uses `$TMPDIR`), this lives under the user's
+/// cache dir in `$HOME`, because macOS Docker Desktop shares `$HOME` by default
+/// but NOT `/var/folders/...`. Returning a per-pid subdir keeps instances apart.
+#[cfg(feature = "docker")]
+pub fn docker_workdir() -> PathBuf {
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("codemcp")
+        .join("work")
+        .join(std::process::id().to_string())
 }
 
 fn default_summary_cache() -> PathBuf {

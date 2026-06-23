@@ -1,12 +1,13 @@
 [package]
 name = "codemcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Meta-MCP code-mode gateway: connect many MCP servers, expose one execute_python tool."
 license = "MIT"
 
 [features]
-default = []
+default = ["docker"]
+docker = ["dep:bollard"]
 monty = ["dep:monty"]
 
 [dependencies]
@@ -46,6 +47,16 @@ axum = "0.8"
 # Used only to auto-detect the launching application (parent process name) for
 # `codemcp info`/`list`. `system` feature is enough; we don't need disk/net/etc.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+# Docker isolation backend. Uses the Docker daemon API directly (no `docker` CLI
+# dependency) and auto-detects Docker/Podman sockets. rustls (ring) keeps us
+# OpenSSL-free, consistent with the static musl release builds.
+# `pipe` = local Unix socket / Windows named pipe connection, which is all
+# codemcp ever uses (we talk to the local daemon, never a remote TLS one). This
+# avoids bollard's TLS/http chain entirely — leaner and no OpenSSL.
+bollard = { version = "0.21", default-features = false, features = [
+  "pipe",
+], optional = true }
 
 # The Monty Rust crate is not published to crates.io under this name; pull from git.
 # Feature-gated and off by default, so default builds never fetch it.

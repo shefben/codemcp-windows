@@ -23,6 +23,9 @@ pub enum Error {
     #[error("execution error: {0}")]
     Exec(String),
 
+    #[error("docker error: {0}")]
+    Docker(String),
+
     #[error("execution timed out after {0:?}")]
     Timeout(std::time::Duration),
 

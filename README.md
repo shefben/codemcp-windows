@@ -45,8 +45,10 @@ Working vertical slice over **stdio** and **Streamable HTTP**:
   to the gateway over an authenticated WebSocket control channel and are routed to
   the right upstream server.
 
-Isolation backends beyond the host process (Docker, Monty) and optional LLM tool
-summaries are planned — see [TODO](#todo--planned-work).
+Runs untrusted agents safely with `CODEMCP_ISOLATION=DOCKER` (the worker runs in
+a container; see [Docker isolation](#docker-isolation)). The Monty in-process
+sandbox and optional LLM tool summaries are still planned — see
+[TODO](#todo--planned-work).
 
 ## Install
 
@@ -286,7 +288,7 @@ All settings are read once at startup from `CODEMCP_*` environment variables.
 | Variable | Default | Description |
 |---|---|---|
 | `CODEMCP_CONFIG` | `~/.config/codemcp/mcp.json` | Path to the upstream `mcp.json`. |
-| `CODEMCP_ISOLATION` | `HOST_SYSTEM` | Execution isolation: `HOST_SYSTEM`, `DOCKER`, `MONTY`. Only `HOST_SYSTEM` is implemented today. |
+| `CODEMCP_ISOLATION` | `HOST_SYSTEM` | Execution isolation: `HOST_SYSTEM` (default) or `DOCKER` (containerized). `MONTY` is not implemented yet. |
 | `CODEMCP_TRANSPORT` | `stdio` | Downstream MCP transport: `stdio` or `http`. |
 | `CODEMCP_ADMIN_SOCKET` | _(per-instance)_ | Override the admin socket path. By default each gateway uses `~/.config/codemcp/admin-<config-hash>-<pid>.sock` so multiple instances don't collide; set this to pin an explicit path. |
 | `CODEMCP_INSTANCE_LABEL` | _(auto)_ | Friendly name for this gateway in `codemcp instances`/`list` (e.g. `opencode`). Falls back to the auto-detected parent process name. |
@@ -312,7 +314,7 @@ plus the variables below.
 | Variable | Default | Description |
 |---|---|---|
 | `CODEMCP_CONTROL_BIND` | `127.0.0.1:0` | Address for the WebSocket control server (`:0` = ephemeral port). |
-| `CODEMCP_CONTROL_HOST_FOR_WORKER` | _(bind IP)_ | Host the worker uses to reach the control server (override for containers/remote). |
+| `CODEMCP_CONTROL_HOST_FOR_WORKER` | _(auto)_ | Host the worker uses to reach the control server. Auto-derived per isolation mode (loopback for HOST; bridge gateway or `host.docker.internal` for DOCKER); set to override for unusual topologies. |
 | `CODEMCP_CONTROL_TOKEN` | _(random per run)_ | Shared secret the worker must send as its first WS frame. |
 
 ### Worker dependency provisioning
@@ -330,12 +332,38 @@ plus the variables below.
 | `CODEMCP_EXEC_TIMEOUT_MS` | `30000` | Per-`run` execution timeout in milliseconds. |
 | `CODEMCP_MAX_OUTPUT_BYTES` | `1048576` | Max captured stdout/stderr bytes. |
 
-### Docker isolation (planned — see TODO)
+### Docker isolation
+
+Set `CODEMCP_ISOLATION=DOCKER` to run the Python worker inside an isolated
+container instead of the host process. The worker uses the **same** `bootstrap.py`
+and the same WebSocket control protocol; only the spawn mechanism and the
+control-channel networking differ. Requires a running Docker (or Podman) daemon
+and a binary built with the `docker` feature (on by default).
+
+Cold start installs `websockets` fresh in the container and (on first use) pulls
+the image, so the first `execute_python` call is slower than on the host.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEMCP_DOCKER_IMAGE` | `python:3.14-slim` | Base image for the Docker executor. |
-| `CODEMCP_DOCKER_EXTRA_ARGS` | _(empty)_ | Extra `docker run` args (whitespace-split). |
+| `CODEMCP_DOCKER_IMAGE` | `python:3.14-slim` | Image the worker runs in. Any stock python image with `pip` works; pulled automatically if missing. |
+| `CODEMCP_DOCKER_NETWORK` | `codemcp-net` | User-defined bridge network the worker attaches to. The control channel binds to this network's gateway only (see security notes). |
+| `CODEMCP_DOCKER_MEMORY` | `0` | Hard memory limit in bytes (`0` = unlimited). |
+| `CODEMCP_DOCKER_CPUS` | `0` | CPU limit in cores, e.g. `1.5` (`0` = unlimited). |
+| `CODEMCP_DOCKER_PIDS_LIMIT` | `0` | Max processes in the container (`0` = unlimited). |
+| `CODEMCP_DOCKER_READONLY` | `false` | Mount the container root filesystem read-only. |
+
+The container is always created with hardening defaults: `--rm` (auto-remove),
+all Linux capabilities dropped, `no-new-privileges`, attached only to the
+dedicated bridge network, and the worker files bind-mounted **read-only**.
+
+> The previous `CODEMCP_DOCKER_EXTRA_ARGS` knob is gone: codemcp talks to the
+> Docker API directly (no `docker run` CLI), so limits are set with the typed
+> variables above.
+
+**On macOS / Windows (Docker Desktop):** the worker workdir is materialized under
+`~/.cache/codemcp/work/<pid>` (inside `$HOME`, which Docker Desktop shares by
+default) rather than `$TMPDIR`. If you point `CODEMCP_DOCKER_IMAGE` at a custom
+setup that needs other host paths, add them to Docker Desktop's file sharing.
 
 ### Monty isolation (planned — see TODO)
 
@@ -361,7 +389,7 @@ upstream MCP server. Choose isolation based on how much you trust the agent.
 | Mode | Status | Isolation | Use when |
 |---|---|---|---|
 | `HOST_SYSTEM` | **implemented** | **None** — full host access with the gateway's privileges, full stdlib + installed packages. | Development / trusted agents only. |
-| `DOCKER` | planned | OS-level container; only the authenticated WebSocket control channel bridges in. | Untrusted agents (recommended). |
+| `DOCKER` | **implemented** | OS-level container; only the authenticated WebSocket control channel bridges in, and that channel is never exposed to the LAN. | Untrusted agents (recommended). |
 | `MONTY` | planned | Strict in-process sandbox: no filesystem/network/env except the SDK callbacks the gateway grants. Limited Python subset (no classes, no third-party libs, partial stdlib). | Maximum safety; simple transform code. |
 
 - **`HOST_SYSTEM` has no sandbox.** It executes with the gateway's privileges.
@@ -371,6 +399,14 @@ upstream MCP server. Choose isolation based on how much you trust the agent.
   token (`CODEMCP_CONTROL_TOKEN`, sent as the first WS frame). It binds loopback by
   default. **Never** expose the control port publicly without TLS and a strong
   token.
+- **DOCKER channel is not LAN-exposed.** The control channel is effectively
+  god-mode over every connected upstream, so codemcp never binds it to `0.0.0.0`.
+  On native Linux it binds the dedicated bridge network's **gateway IP** (a
+  host-internal interface that is not routed to your physical network). On Docker
+  Desktop (macOS/Windows), where the host can't bind the bridge IP, it binds
+  **loopback** and lets the container reach it via `host.docker.internal` (which
+  Docker Desktop forwards to host loopback). Either way, only the worker
+  container — not other machines on the same Wi‑Fi — can reach the port.
 - **HTTP transport.** The Streamable HTTP server validates the `Host` header
   against a loopback allow-list by default to prevent DNS-rebinding attacks. Set
   appropriate hosts/origins before any non-loopback deployment, and front it with
@@ -380,16 +416,6 @@ upstream MCP server. Choose isolation based on how much you trust the agent.
 
 These phases are designed but not yet implemented. Configuration knobs already
 exist (see tables above) but are inert until the backends land.
-
-### Phase 7 — Docker isolation (`exec/docker.rs`)
-
-Run the Python worker inside a Docker container instead of the host. The same
-`Executor` trait and WebSocket control channel apply; the container reaches the
-gateway via `CODEMCP_CONTROL_HOST_FOR_WORKER` (e.g. `host.docker.internal`). The
-worker self-provisions `websockets`, so the stock `python:3.x-slim` image works
-with no custom build. Honors `CODEMCP_DOCKER_IMAGE` and
-`CODEMCP_DOCKER_EXTRA_ARGS`. This is the recommended isolation for untrusted
-agents.
 
 ### Phase 8 — Monty isolation (`exec/monty.rs`, feature-gated)
 
