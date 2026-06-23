@@ -121,11 +121,11 @@ sandbox and optional LLM tool summaries are still planned — see
 ### One-line install (prebuilt binary)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/skymoore/codemcp/main/install.sh | sh
 ```
 
 This downloads a prebuilt binary for your OS/arch from
-[GitHub Releases](https://github.com/basedatum/codemcp/releases), verifies its
+[GitHub Releases](https://github.com/skymoore/codemcp/releases), verifies its
 SHA-256 checksum, and installs it to `~/.local/bin` (or `/usr/local/bin`).
 Supported platforms: macOS (arm64, x86_64) and Linux (arm64, x86_64).
 
@@ -133,7 +133,7 @@ Useful overrides:
 
 ```sh
 # pin a version and/or choose the install dir
-curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/skymoore/codemcp/main/install.sh \
   | CODEMCP_VERSION=v0.1.0 CODEMCP_BIN_DIR="$HOME/bin" sh
 ```
 
@@ -141,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh \
 | ----------------- | -------------------------------------------------- |
 | `CODEMCP_VERSION` | Release tag to install (default: latest)           |
 | `CODEMCP_BIN_DIR` | Install directory                                  |
-| `CODEMCP_REPO`    | `owner/repo` to download from (default `basedatum/codemcp`) |
+| `CODEMCP_REPO`    | `owner/repo` to download from (default `skymoore/codemcp`) |
 
 > opencode launches `codemcp` by bare name, so the install dir must be on your
 > `PATH`. The installer prints the exact line to add if it isn't.

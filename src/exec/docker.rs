@@ -343,7 +343,7 @@ async fn create_and_start(
         working_dir: Some(CONTAINER_WORKDIR.to_string()),
         host_config: Some(host_config),
         labels: Some(std::collections::HashMap::from([(
-            "com.basedatum.codemcp".to_string(),
+            "com.skymoore.codemcp".to_string(),
             std::process::id().to_string(),
         )])),
         ..Default::default()

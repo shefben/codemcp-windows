@@ -2,13 +2,13 @@
 # codemcp installer.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/basedatum/codemcp/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/skymoore/codemcp/main/install.sh | sh
 #
 # Environment overrides:
 #   CODEMCP_VERSION   Release tag to install (default: latest). e.g. v0.1.0
 #   CODEMCP_BIN_DIR   Install directory (default: first writable of
 #                     $HOME/.local/bin, /usr/local/bin; falls back with sudo).
-#   CODEMCP_REPO      GitHub owner/repo (default: basedatum/codemcp).
+#   CODEMCP_REPO      GitHub owner/repo (default: skymoore/codemcp).
 #   CODEMCP_BASE_URL  Override the release download base URL (for mirrors/testing).
 #                     When set, CODEMCP_VERSION must also be set (no auto-latest).
 #
@@ -17,7 +17,7 @@
 
 set -eu
 
-REPO="${CODEMCP_REPO:-basedatum/codemcp}"
+REPO="${CODEMCP_REPO:-skymoore/codemcp}"
 BIN="codemcp"
 
 info() { printf '%s\n' "$*" >&2; }
