@@ -114,6 +114,37 @@ impl Runtime {
         self.inner.sdk.lock().await.description.clone()
     }
 
+    /// The full MCP `Tool` object the model sees in `tools/list`: name,
+    /// description, and the fixed `{code: string}` input schema.
+    pub async fn tool_definition(&self) -> serde_json::Value {
+        use serde_json::{json, Map};
+        let schema: Map<String, serde_json::Value> = json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source to execute. SDK functions are preloaded; \
+                                    assign to `result` (or leave a final expression) to return a value."
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        })
+        .as_object()
+        .cloned()
+        .expect("schema is an object");
+        json!({
+            "name": "execute_python",
+            "description": self.description().await,
+            "inputSchema": schema,
+        })
+    }
+
+    /// Current generated `sdk.py` source (clone).
+    pub async fn sdk_py(&self) -> String {
+        self.inner.sdk.lock().await.registry.generate_sdk_py()
+    }
+
     /// Run user code in the Python worker.
     pub async fn executor_run(&self, code: String) -> Result<crate::control::RunOutput, Error> {
         self.inner.executor.run(code).await

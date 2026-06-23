@@ -49,6 +49,18 @@ pub enum Command {
         #[command(flatten)]
         instance: InstanceSel,
     },
+    /// Print the `execute_python` tool definition (name + description +
+    /// inputSchema) as the model sees it in `tools/list`.
+    Tool {
+        #[command(flatten)]
+        instance: InstanceSel,
+    },
+    /// Print the generated `sdk.py` (the typed Python SDK preloaded into the
+    /// worker).
+    Sdk {
+        #[command(flatten)]
+        instance: InstanceSel,
+    },
     /// Connect an upstream in the running gateway (no restart).
     Enable {
         /// Server name as it appears in mcp.json.
@@ -117,6 +129,31 @@ pub async fn run_admin(cmd: Command) -> Result<(), Error> {
             println!("# gateway [{}] pid {}", target.launcher, target.pid);
             let resp = admin::client_request(instance.instance.as_deref(), "list", json!({})).await?;
             print_list(&resp);
+        }
+        Command::Tool { instance } => {
+            let target = admin::select_instance(instance.instance.as_deref()).await?;
+            let _ = target;
+            let resp = admin::client_request(instance.instance.as_deref(), "tool", json!({}))
+                .await?;
+            if let Some(err) = resp.get("error").and_then(Value::as_str) {
+                eprintln!("error: {err}");
+            } else if let Some(tool) = resp.get("tool") {
+                println!("{}", serde_json::to_string_pretty(tool).unwrap_or_default());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+            }
+        }
+        Command::Sdk { instance } => {
+            admin::select_instance(instance.instance.as_deref()).await?;
+            let resp = admin::client_request(instance.instance.as_deref(), "sdk", json!({}))
+                .await?;
+            if let Some(err) = resp.get("error").and_then(Value::as_str) {
+                eprintln!("error: {err}");
+            } else if let Some(sdk) = resp.get("sdk").and_then(Value::as_str) {
+                print!("{sdk}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+            }
         }
         Command::Enable {
             name,

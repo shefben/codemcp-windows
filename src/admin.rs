@@ -170,6 +170,12 @@ async fn dispatch(runtime: &Runtime, req: Request) -> Value {
             let servers = runtime.list().await;
             json!({ "servers": servers })
         }
+        "tool" => {
+            json!({ "tool": runtime.tool_definition().await })
+        }
+        "sdk" => {
+            json!({ "sdk": runtime.sdk_py().await })
+        }
         "enable" => match serde_json::from_value::<EnableParams>(req.params) {
             Ok(p) => match runtime.enable(&p.name, p.make_default).await {
                 Ok(tools) => json!({
