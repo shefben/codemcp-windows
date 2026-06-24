@@ -64,16 +64,6 @@ pub async fn start(
     // Determine the callback port and path from the OAuth config.
     let (callback_port, callback_path) = resolve_callback_config(oauth_config);
 
-    // We need to bind the callback port first to know the redirect URI, but
-    // we need the CSRF state for the callback server, and we need the redirect
-    // URI for start_authorization. Solution: start with a placeholder state,
-    // get the auth URL, parse the state from it, then we're already listening.
-    //
-    // Actually, the callback server validates `state` against `expected_state`.
-    // We don't know the state until after start_authorization generates it.
-    // So we start the callback server after getting the auth URL, using the
-    // state parsed from the URL.
-
     // Create the OAuth state machine.
     let mut oauth_state = OAuthState::new(url.to_string(), None).await?;
 
@@ -82,42 +72,24 @@ pub async fn start(
         manager.set_credential_store(FileCredentialStore::new(name, url));
     }
 
-    // Determine the redirect URI. If a fixed port is configured, we can compute
-    // it now. If ephemeral, we'll know after binding.
-    let redirect_uri = if let Some(port) = callback_port {
-        format!("http://127.0.0.1:{port}{callback_path}")
-    } else {
-        // Ephemeral: we need to bind first. But start_authorization needs the
-        // redirect URI. So we bind a placeholder, get the port, construct the
-        // URI, then start the real callback server with the CSRF state.
-        // However, we can't start the callback server without the CSRF state
-        // (which comes from start_authorization). And start_authorization needs
-        // the redirect URI (which needs the port from binding).
-        //
-        // Solution: bind the TCP listener ourselves to get the port, construct
-        // the redirect URI, call start_authorization, parse the state from the
-        // auth URL, then hand the listener to the callback server.
-        //
-        // For simplicity, let's use a fixed approach: bind a listener, construct
-        // the URI, start authorization, then create the callback server using
-        // the already-bound listener. But our callback::start takes a port and
-        // binds its own listener. Let me restructure to avoid double-binding.
-        //
-        // Simpler: just use a fixed default port for ephemeral. Actually, let's
-        // just bind eagerly to get the port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| AuthError::InternalError(format!("callback bind failed: {e}")))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| AuthError::InternalError(format!("callback addr: {e}")))?
-            .port();
-        // Drop the listener; the callback server will rebind. There's a tiny
-        // TOCTOU race but it's on localhost and the port is unlikely to be
-        // taken in the milliseconds between drop and rebind.
-        drop(listener);
-        format!("http://127.0.0.1:{port}{callback_path}")
+    // Bind the callback listener up front so we know the exact port before
+    // constructing the redirect URI. Binding once (and never dropping/rebinding)
+    // eliminates the TOCTOU race where an ephemeral port could change between
+    // discovery and serving.
+    let bind_addr = match callback_port {
+        Some(p) => format!("127.0.0.1:{p}"),
+        None => "127.0.0.1:0".to_string(),
     };
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| {
+            AuthError::InternalError(format!("callback bind failed on {bind_addr}: {e}"))
+        })?;
+    let actual_port = listener
+        .local_addr()
+        .map_err(|e| AuthError::InternalError(format!("callback addr: {e}")))?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{actual_port}{callback_path}");
 
     // Start the authorization (metadata discovery + client registration).
     // Pass empty scopes to let the SDK auto-select from server metadata.
@@ -138,23 +110,11 @@ pub async fn start(
         AuthError::InternalError("authorization URL missing state parameter".to_string())
     })?;
 
-    // Start the callback server now that we know the expected state.
-    let (mut server, rx) = callback::start(callback_port, callback_path, csrf_state.clone())
+    // Hand the already-bound listener to the callback server, so it serves on
+    // exactly the port we used in the redirect URI.
+    let (server, rx) = callback::start_with_listener(listener, callback_path, csrf_state.clone())
         .await
         .map_err(AuthError::InternalError)?;
-
-    // If we used an ephemeral port, the redirect_uri we passed to
-    // start_authorization must match the callback server's redirect_uri.
-    // This is guaranteed because we computed the port from the same bind.
-    // But if the callback server rebound on a different port (race), we'd
-    // have a mismatch. In practice this doesn't happen on localhost.
-    if callback_port.is_none() && server.redirect_uri != redirect_uri {
-        server.stop();
-        return Err(AuthError::InternalError(format!(
-            "callback port mismatch: expected {redirect_uri}, got {}",
-            server.redirect_uri
-        )));
-    }
 
     let result = AuthStartResult {
         authorization_url: auth_url,

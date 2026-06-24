@@ -97,6 +97,9 @@ pub enum CallbackResult {
 
 /// A running callback server. Drop the guard to stop it.
 pub struct CallbackServer {
+    /// The full redirect URI this server listens on (informational; the login
+    /// flow constructs the same URI from the bound port).
+    #[allow(dead_code)]
     pub redirect_uri: String,
     #[allow(dead_code)]
     pub port: u16,
@@ -113,26 +116,22 @@ impl CallbackServer {
     }
 }
 
-/// Start a callback server on `127.0.0.1`. If `port` is `Some`, bind to that
-/// port; otherwise bind to an ephemeral port. The `expected_state` is the CSRF
-/// token that the OAuth provider embedded in the authorization URL — the
-/// callback validates it matches the `state` query parameter.
+/// Start a callback server using an **already-bound** `TcpListener`.
 ///
-/// Returns the running server plus a receiver that resolves with the
+/// The caller binds the listener, reads its port, constructs the OAuth redirect
+/// URI from that exact port, then hands ownership of the listener here. Binding
+/// once (no drop-and-rebind) avoids the TOCTOU race where an ephemeral port
+/// could change between redirect-URI construction and serving.
+///
+/// The `expected_state` is the CSRF token the OAuth provider embedded in the
+/// authorization URL — the callback validates it matches the `state` query
+/// parameter. Returns the running server plus a receiver that resolves with the
 /// authorization code (or an error) when the callback is hit.
-pub async fn start(
-    port: Option<u16>,
+pub async fn start_with_listener(
+    listener: TcpListener,
     path: &str,
     expected_state: String,
 ) -> Result<(CallbackServer, oneshot::Receiver<CallbackResult>), String> {
-    let bind_addr = match port {
-        Some(p) => format!("127.0.0.1:{p}"),
-        None => "127.0.0.1:0".to_string(),
-    };
-
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| format!("cannot bind callback server on {bind_addr}: {e}"))?;
     let actual_port = listener
         .local_addr()
         .map_err(|e| format!("cannot get bound port: {e}"))?
