@@ -2,6 +2,8 @@
 //! gateway. The `list`/`enable`/`disable` subcommands are a thin admin client
 //! that talks to a running gateway over its Unix admin socket.
 
+use std::process;
+
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -140,19 +142,33 @@ pub enum Command {
         harness: Harness,
     },
     /// Interactive terminal UI for enabling/disabling servers and individual
-    /// tools against a running gateway, with session-only or persisted
-    /// (default) semantics. (Requires the `tui` feature.)
-    Tui {
-        #[command(flatten)]
-        instance: InstanceSel,
-    },
-}
+     /// tools against a running gateway, with session-only or persisted
+     /// (default) semantics. (Requires the `tui` feature.)
+     Tui {
+         #[command(flatten)]
+         instance: InstanceSel,
+     },
+
+     /// Check if a newer version of codemcp is available.
+     ///
+     /// Prints the currently installed version and, if different, the latest
+     /// available version with a link to release notes.
+     CheckUpdate,
+
+     /// Download and install the latest version of codemcp.
+     Update,
+ }
 
 impl Command {
     /// Whether this command is handled synchronously without the gateway/admin
-    /// socket (i.e. `setup`).
+    /// socket (i.e. `setup`, `check-update`, and `update`).
     pub fn is_local(&self) -> bool {
-        matches!(self, Command::Setup { .. })
+        matches!(
+            self,
+            Command::Setup { .. }
+                | Command::CheckUpdate
+                | Command::Update
+        )
     }
 
     /// Whether this command runs the gateway itself (i.e. `start`).
@@ -161,12 +177,42 @@ impl Command {
     }
 }
 
-/// Run a local (non-admin) subcommand. Currently just `setup`.
-pub fn run_local(cmd: Command) -> Result<(), Error> {
+/// Run a local (non-admin) subcommand. Currently `setup`, `check-update`, and
+/// `update`.
+pub async fn run_local(cmd: Command) -> Result<(), Error> {
     match cmd {
         Command::Setup { harness } => setup::run(harness),
+        Command::CheckUpdate => run_check_update().await,
+        Command::Update => crate::update::update().await,
         _ => unreachable!("run_local called with a non-local command"),
     }
+}
+
+/// Run the `check-update` subcommand. Checks what the latest version on GitHub
+/// is and compares it against the currently running binary's version.
+async fn run_check_update() -> Result<(), Error> {
+    let current = env!("CARGO_PKG_VERSION");
+
+    match crate::update::check_latest().await {
+        Ok(release) => {
+            if crate::update::is_outdated(current, &release.version) {
+                println!("codemcp {current} is installed; {} is available.", release.version);
+                println!();
+                println!("  Update:    codemcp update");
+                if let Some(url) = &release.html_url {
+                    println!("  Notes:     {url}");
+                }
+            } else {
+                println!("codemcp {current} is up to date.");
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    Ok(())
 }
 
 /// Run an admin subcommand against a live gateway. Prints human-readable output.
@@ -365,6 +411,8 @@ pub async fn run_admin(cmd: Command) -> Result<(), Error> {
         }
         Command::Start { .. } => unreachable!("start is handled by run_gateway"),
         Command::Setup { .. } => unreachable!("setup is handled by run_local"),
+        Command::CheckUpdate => unreachable!("check-update is handled by run_local"),
+        Command::Update => unreachable!("update is handled by run_local"),
     }
     Ok(())
 }

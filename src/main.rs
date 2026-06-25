@@ -21,6 +21,7 @@ mod sdk;
 mod server;
 mod setup;
 mod tui;
+mod update;
 mod upstream;
 
 use std::sync::Arc;
@@ -49,9 +50,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(command) = cli.command {
-        // `setup` runs locally without touching the gateway/admin socket.
+        // `setup`, `check-update`, and `update` run locally without touching the
+        // gateway/admin socket.
         if command.is_local() {
-            return cli::run_local(command).map_err(Into::into);
+            return cli::run_local(command).await.map_err(Into::into);
         }
         // `start` runs the gateway itself (shared HTTP instance).
         if command.is_gateway() {
@@ -97,6 +99,26 @@ async fn build_executor(
             anyhow::bail!(
                 "CODEMCP_ISOLATION=MONTY is not implemented yet; use HOST_SYSTEM or DOCKER"
             )
+        }
+    }
+}
+
+/// Check for a newer version on startup and print a warning to stderr if
+/// the installed binary is outdated. This runs in a background task so it
+/// does not block gateway startup.
+async fn check_update_on_startup() {
+    let installed = env!("CARGO_PKG_VERSION");
+    // Network errors are silently ignored — an update check must never disrupt startup.
+    if let Ok(release) = update::check_latest().await {
+        if update::is_outdated(installed, &release.version) {
+            eprintln!(
+                "WARNING: codemcp {} is available (you have {}).",
+                release.version, installed
+            );
+            eprintln!("  Update:    codemcp update");
+            if let Some(url) = &release.html_url {
+                eprintln!("  Notes:     {}", url);
+            }
         }
     }
 }
@@ -217,6 +239,16 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     }
 
     let code_server = CodeServer::new(runtime.clone());
+
+    // Check for updates after startup is complete (non-blocking). Spawned last,
+    // with a brief delay, so the notice prints after the startup logs rather
+    // than racing ahead of them. Network errors are silently ignored.
+    if settings.check_update {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            check_update_on_startup().await;
+        });
+    }
 
     match settings.transport {
         ServerTransport::Stdio => {

@@ -91,6 +91,9 @@ pub struct Settings {
     pub summary_cache: PathBuf,
 
     pub log: String,
+
+    /// Whether to check for updates on startup (default `"true"`).
+    pub check_update: bool,
 }
 
 impl Default for Settings {
@@ -124,6 +127,7 @@ impl Default for Settings {
             summary_api_key: None,
             summary_cache: default_summary_cache(),
             log: "info".to_string(),
+            check_update: true,
         }
     }
 }
