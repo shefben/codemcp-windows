@@ -3,7 +3,9 @@
 A single MCP server that connects to many upstream MCP servers and exposes
 **one tool: `execute_python`**. Agents write Python that calls every upstream
 tool as a typed function and transform/combine results in-process — instead of
-issuing many sequential MCP tool calls.
+issuing many sequential MCP tool calls. SDK calls are dispatched concurrently:
+every call fires its request the moment it is made and blocks only when its
+value is actually read, so independent calls overlap automatically.
 
 ```
 agent harness ──MCP──► codemcp gateway ──MCP clients──► upstream servers
@@ -33,6 +35,19 @@ result = {"title": pr["title"], "files_changed": len(pr["files"])}
 ```
 
 One model turn, one tool call, only the final result returned.
+
+Independent calls overlap automatically — both requests are on the wire before
+either result is read, no special syntax needed:
+
+```python
+issues  = github_search_issues(query="bug", state="open")
+commits = github_list_commits(repo="codemcp", sha="main")
+result  = {"issue_count": issues["total_count"], "latest": commits[0]["sha"]}
+```
+
+Live measurement: 4 independent GitHub API calls overlap to **~1.48 s** vs
+**~4.26 s** when each result is read before the next call is made — a **~2.9×
+speedup** on real network round-trips, with the agent writing ordinary Python.
 
 ## Bench: token usage vs direct MCP
 
@@ -540,9 +555,12 @@ and one global SDK state (an admin `enable`/`disable` affects all clients).
    `execute_python` call sends the user's code to the worker, which runs it and
    returns `{ result, stdout, stderr }`. Assign to `result` (or leave a final
    expression) to return a value.
-5. **Route SDK calls.** When user code calls an SDK function, the worker sends a
-   `call_tool` request back to the gateway over the WebSocket control channel; the
-   gateway forwards it to the right upstream MCP server and returns the result.
+5. **Route SDK calls — concurrently.** Each SDK call sends its `call_tool`
+   request over the control channel immediately and returns a `Pending` handle
+   that resolves on first use. Calls made before any result is read are already
+   in flight by the time the first value is accessed. The gateway dispatches each
+   `call_tool` on its own async task so upstream round-trips overlap rather than
+   serializing.
 
 ### Control channel
 
@@ -554,9 +572,47 @@ then flow both ways on the one connection:
 - gateway → worker: `run { code }`
 - worker → gateway: `call_tool { server, tool, args }`
 
+The worker sends `call_tool` requests without waiting for responses, so a burst
+of calls from agent code travels over the socket concurrently. On the gateway
+side each incoming `call_tool` is dispatched on its own async task, so upstream
+round-trips overlap; responses flow back in any order, matched to their pending
+requests by JSON-RPC id.
+
 One protocol covers host loopback, future Docker workers (Linux + macOS), and
 future remote workers, and is natively bidirectional with built-in message
 framing.
+
+### Concurrent tool calls
+
+Every SDK call dispatches its request immediately and returns a `Pending` handle
+instead of blocking. The handle resolves transparently on first access (subscript,
+attribute, iteration, `str()`, equality), so from the agent's perspective an SDK
+call looks and behaves like a normal function call — it just happens to overlap
+with any other calls that were made before its value was read.
+
+Concurrency therefore needs no special construct: a list comprehension that issues
+many calls and then reads them runs those calls in parallel.
+
+```python
+# All requests go out first; reading them resolves whatever is already in flight.
+pages = [github_get_file_contents(repo=r, path="README.md") for r in repo_list]
+texts = [p["content"] for p in pages]
+```
+
+`Pending` and `ToolError` are injected into the execution namespace. `ToolError`
+is raised when a call fails at the protocol level (transport error or JSON-RPC
+error from the gateway). API-level failures from upstream servers (e.g. HTTP 404)
+come back as text content inside a successful MCP response — those surface as
+strings, not `ToolError`. `Pending.result()` forces explicit resolution, which is
+useful when you need to catch errors before the value is read:
+
+```python
+p = github_get_file_contents(owner="org", repo="r", path="f")
+try:
+    val = p.result()
+except ToolError as e:
+    val = None
+```
 
 ### Self-provisioning worker
 

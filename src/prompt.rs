@@ -14,6 +14,13 @@ pub fn build_description(registry: &SdkRegistry, isolation: Isolation) -> String
          typed functions, then transform and combine their results in a single step.\n\n",
     );
     s.push_str(
+        "Independent tool calls run concurrently automatically: each call is dispatched the \
+         instant you make it and only blocks when you read its result. To overlap calls, make \
+         them before reading any result: ``a = tool1(...); b = tool2(...); use(a, b)`` — both \
+         requests are already in flight when you read ``a``. A call you read immediately \
+         (``x = tool(...)[\"k\"]``) just blocks like a normal function.\n\n",
+    );
+    s.push_str(
         "All SDK functions below are ALREADY IMPORTED into your execution namespace — \
          do NOT import them. Call them directly. Return a value by assigning to `result` \
          or leaving it as the last expression; anything printed to stdout is also captured.\n\n",

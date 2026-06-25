@@ -195,7 +195,20 @@ impl ControlServer {
                         break;
                     }
                 };
-                if let Err(e) =
+                // `call_tool` requests are dispatched on their own task so the
+                // read loop keeps draining frames. This lets a worker fire many
+                // tool calls in a burst and have their upstream round-trips
+                // overlap instead of serializing one frame at a time. `run`
+                // responses are routed inline (cheap, no I/O).
+                if is_call_tool(&text) {
+                    let upstreams = upstreams.clone();
+                    let outbound = outbound_for_reader.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_call_tool(&text, &upstreams, &outbound).await {
+                            tracing::warn!(error = %e, "error handling call_tool frame");
+                        }
+                    });
+                } else if let Err(e) =
                     handle_incoming(&text, &pending_reader, &upstreams, &outbound_for_reader).await
                 {
                     tracing::warn!(error = %e, "error handling worker frame");
@@ -234,11 +247,22 @@ struct JsonRpcResponse<'a> {
     error: Option<Value>,
 }
 
-/// Dispatch an incoming JSON-RPC frame from the worker.
+/// Cheap check for whether a frame is a `call_tool` request, so the reader can
+/// route it to a spawned task without fully parsing/handling it inline.
+fn is_call_tool(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => v.get("method").and_then(Value::as_str) == Some("call_tool"),
+        Err(_) => false,
+    }
+}
+
+/// Dispatch an incoming JSON-RPC frame from the worker (run responses + any
+/// non-`call_tool` request). `call_tool` requests are handled separately by
+/// [`handle_call_tool`] so they can run concurrently.
 async fn handle_incoming(
     text: &str,
     pending: &Pending,
-    upstreams: &SharedUpstreams,
+    _upstreams: &SharedUpstreams,
     outbound: &mpsc::UnboundedSender<Message>,
 ) -> Result<(), Error> {
     let msg: Value = serde_json::from_str(text)?;
@@ -266,50 +290,57 @@ async fn handle_incoming(
         return Ok(());
     }
 
-    // Otherwise it's a request from the worker.
+    // Otherwise it's a request from the worker. `call_tool` is handled by the
+    // caller via a spawned task; anything else is unknown.
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    tracing::warn!(method = %method, "unknown method from worker");
+    let response = JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(json!({ "code": -32601, "message": "method not found" })),
+    };
+    let text = serde_json::to_string(&response)?;
+    let _ = outbound.send(Message::Text(text));
+    Ok(())
+}
 
-    match method {
-        "call_tool" => {
-            let params: CallToolParams =
-                serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null))?;
-            let response = match upstreams
-                .call_tool(&params.server, &params.tool, Some(params.args))
-                .await
-            {
-                Ok(result) => {
-                    let value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                    JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(value),
-                        error: None,
-                    }
-                }
-                Err(e) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: None,
-                    error: Some(json!({ "code": -32000, "message": e.to_string() })),
-                },
-            };
-            let text = serde_json::to_string(&response)?;
-            outbound
-                .send(Message::Text(text))
-                .map_err(|_| Error::Worker("cannot send call_tool response".into()))?;
-        }
-        other => {
-            tracing::warn!(method = %other, "unknown method from worker");
-            let response = JsonRpcResponse {
+/// Forward a single `call_tool` request to the upstream and send back its
+/// response. Runs on its own task so concurrent calls overlap.
+async fn handle_call_tool(
+    text: &str,
+    upstreams: &SharedUpstreams,
+    outbound: &mpsc::UnboundedSender<Message>,
+) -> Result<(), Error> {
+    let msg: Value = serde_json::from_str(text)?;
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let params: CallToolParams =
+        serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null))?;
+
+    let response = match upstreams
+        .call_tool(&params.server, &params.tool, Some(params.args))
+        .await
+    {
+        Ok(result) => {
+            let value = serde_json::to_value(&result).unwrap_or(Value::Null);
+            JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
-                result: None,
-                error: Some(json!({ "code": -32601, "message": "method not found" })),
-            };
-            let text = serde_json::to_string(&response)?;
-            let _ = outbound.send(Message::Text(text));
+                result: Some(value),
+                error: None,
+            }
         }
-    }
+        Err(e) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(json!({ "code": -32000, "message": e.to_string() })),
+        },
+    };
+    let text = serde_json::to_string(&response)?;
+    outbound
+        .send(Message::Text(text))
+        .map_err(|_| Error::Worker("cannot send call_tool response".into()))?;
     Ok(())
 }

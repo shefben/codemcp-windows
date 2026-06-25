@@ -76,11 +76,111 @@ _ensure_websockets()
 import websockets  # noqa: E402
 
 
+# ── concurrent execution context ─────────────────────────────
+#
+# User code runs in a worker thread; the WebSocket lives on the asyncio event
+# loop in the main thread. An SDK call *fires* its `call_tool` request onto the
+# loop immediately (so the request is on the wire right away) and returns a
+# `Pending` handle that resolves lazily — it blocks only when user code first
+# reads its value (attribute, index, iteration, etc.).
+#
+# This gives concurrency for free: any calls issued before a result is read are
+# already in flight by the time the first value is accessed, so their round-trips
+# overlap. No special syntax is required.
+
+# Per-worker-thread handle to the event loop, so a `Pending` can reach it to
+# resolve even though it runs on the worker thread.
+_thread_local = threading.local()
+
+
+class ToolError(RuntimeError):
+    """Raised when an upstream tool call fails."""
+
+
+class Pending:
+    """A handle to an in-flight `call_tool` request.
+
+    The request is already on the wire. The result is fetched lazily and cached
+    on first access. Most value-like operations (indexing, attribute access,
+    iteration, truthiness, str/repr, equality) transparently resolve, so in the
+    common case user code can treat a `Pending` exactly like the returned value.
+
+    Call ``.result()`` to force resolution explicitly.
+    """
+
+    __slots__ = ("_fut", "_loop", "_server", "_tool", "_resolved", "_value")
+
+    def __init__(self, fut, loop, server, tool):
+        self._fut = fut
+        self._loop = loop
+        self._server = server
+        self._tool = tool
+        self._resolved = False
+        self._value = None
+
+    def result(self, timeout=None):
+        """Block until the round-trip completes and return the unwrapped value."""
+        if self._resolved:
+            return self._value
+        msg = asyncio.run_coroutine_threadsafe(
+            _await_future(self._fut), self._loop
+        ).result(timeout)
+        if isinstance(msg, dict) and msg.get("error") is not None:
+            raise ToolError(f"tool {self._server}/{self._tool} failed: {msg['error']}")
+        value = _unwrap_tool_result(msg.get("result") if isinstance(msg, dict) else msg)
+        self._value = value
+        self._resolved = True
+        return value
+
+    # ── transparent resolution for ergonomic sequential use ──
+    def __getitem__(self, key):
+        return self.result()[key]
+
+    def __getattr__(self, name):
+        # Internal slot names are served by the descriptor protocol and never
+        # reach here once set. Guard against recursion if accessed before init
+        # completes (e.g. during unpickling) and shield dunder lookups so the
+        # proxy doesn't accidentally claim to implement arbitrary protocols.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.result(), name)
+
+    def __iter__(self):
+        return iter(self.result())
+
+    def __len__(self):
+        return len(self.result())
+
+    def __contains__(self, item):
+        return item in self.result()
+
+    def __bool__(self):
+        return bool(self.result())
+
+    def __eq__(self, other):
+        return self.result() == other
+
+    def __ne__(self, other):
+        return self.result() != other
+
+    def __hash__(self):
+        return hash(self.result())
+
+    def __repr__(self):
+        if self._resolved:
+            return repr(self._value)
+        return f"<Pending {self._server}/{self._tool}>"
+
+    def __str__(self):
+        return str(self.result())
+
+
 class Dispatcher:
     """Bridges synchronous user-code SDK calls to the async WebSocket.
 
-    User code runs in a worker thread; SDK calls schedule a `call_tool` request
-    on the event loop and block the thread until the response arrives.
+    An SDK call schedules a `call_tool` request on the event loop (firing it
+    immediately) and returns a `Pending` handle. The handle blocks only when its
+    value is actually needed, which is what lets independent calls overlap.
     """
 
     def __init__(self, ws, loop):
@@ -102,7 +202,7 @@ class Dispatcher:
             fut.set_result(msg)
 
     def call_tool(self, server, tool, args):
-        """Synchronous: send call_tool and block for the result."""
+        """Fire a `call_tool` request and return a lazily-resolved `Pending`."""
         rid = self._next_id()
         request = {
             "jsonrpc": "2.0",
@@ -117,16 +217,9 @@ class Dispatcher:
         async def _send():
             await self._ws.send(json.dumps(request))
 
+        # Fire now: the request is on the wire before we return.
         asyncio.run_coroutine_threadsafe(_send(), self._loop)
-
-        # Block this (worker) thread until the loop resolves the future.
-        result_msg = asyncio.run_coroutine_threadsafe(
-            _await_future(fut), self._loop
-        ).result()
-
-        if "error" in result_msg and result_msg["error"] is not None:
-            raise RuntimeError(f"tool {server}/{tool} failed: {result_msg['error']}")
-        return _unwrap_tool_result(result_msg.get("result"))
+        return Pending(fut, self._loop, server, tool)
 
 
 async def _await_future(fut):
@@ -161,12 +254,18 @@ def _unwrap_tool_result(result):
 def _exec_user_code(code, sdk_module, dispatcher):
     """Execute user code, returning (result, stdout, stderr, error)."""
     namespace = {"__name__": "__codemcp__"}
-    # Inject all SDK functions.
+    # Inject SDK functions directly — each returns a Pending when called.
     for name in dir(sdk_module):
         if not name.startswith("_"):
             namespace[name] = getattr(sdk_module, name)
+
     # Wire dispatch into the SDK module.
     sdk_module._codemcp_dispatch = dispatcher.call_tool
+
+    namespace["Pending"] = Pending
+    namespace["ToolError"] = ToolError
+    # Remember the loop so Pending can reach it from this thread.
+    _thread_local._loop = dispatcher._loop
 
     out, err = io.StringIO(), io.StringIO()
     result_value = None
@@ -177,6 +276,9 @@ def _exec_user_code(code, sdk_module, dispatcher):
             exec(compiled, namespace)
             # Convention: `result` variable, else None.
             result_value = namespace.get("result")
+            # If the result is still a Pending, resolve it before returning.
+            if isinstance(result_value, Pending):
+                result_value = result_value.result()
     except Exception:
         error = traceback.format_exc()
 
@@ -184,6 +286,8 @@ def _exec_user_code(code, sdk_module, dispatcher):
 
 
 def _json_safe(value):
+    if isinstance(value, Pending):
+        value = value.result()
     try:
         json.dumps(value)
         return value
