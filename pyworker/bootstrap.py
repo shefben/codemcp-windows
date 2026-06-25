@@ -17,8 +17,12 @@ Environment (set by the gateway):
   CODEMCP_WS_CACHE_DIR       dir for the self-installed websockets package
 """
 
+import ast
 import asyncio
+import builtins
 import contextlib
+import difflib
+import inspect
 import io
 import json
 import os
@@ -251,8 +255,242 @@ def _unwrap_tool_result(result):
     return result
 
 
+# ── pre-flight static validation ─────────────────────────────
+#
+# Before executing agent-written code we statically check it against the SDK
+# contract: catch syntax errors, calls to a misspelled SDK function, and bad
+# arguments to a known SDK function (unknown kwarg, missing required arg). This
+# turns a wasted execution round-trip (run broken code → return a raw traceback →
+# model retries on a more expensive turn) into a precise, structured hint the
+# model can act on in the same turn.
+#
+# The check is deliberately conservative: it only flags things it is confident
+# about. Locally-defined functions, builtins, attribute calls (`x.foo()`), and
+# dynamic patterns are never flagged. The real `sdk_module` is the source of
+# truth for signatures (via `inspect.signature`), so the contract can never drift
+# from the generated SDK.
+
+# Names always available in the exec namespace besides the SDK functions.
+_RUNTIME_INJECTED_NAMES = frozenset({"Pending", "ToolError", "result"})
+
+# How close a bare-name call must be to an SDK function name before we treat it
+# as a typo worth flagging (difflib ratio, 0..1). High to avoid false positives.
+_SUGGEST_CUTOFF = 0.7
+
+
+def _sdk_function_names(sdk_module):
+    """Public functions exposed by the generated SDK module, keyed by name."""
+    names = {}
+    for name in dir(sdk_module):
+        if name.startswith("_"):
+            continue
+        obj = getattr(sdk_module, name, None)
+        if inspect.isfunction(obj):
+            names[name] = obj
+    return names
+
+
+def _collect_bound_names(tree):
+    """Names the user code itself defines (so we don't flag them as unknown).
+
+    Covers assignments, function/class defs, imports, comprehension targets,
+    `for` targets, `with ... as`, `except ... as`, and function parameters.
+    Conservative: any name that *might* be locally bound is collected.
+    """
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            args = getattr(node, "args", None)
+            if args is not None:
+                for a in (
+                    list(args.posonlyargs)
+                    + list(args.args)
+                    + list(args.kwonlyargs)
+                ):
+                    bound.add(a.arg)
+                if args.vararg:
+                    bound.add(args.vararg.arg)
+                if args.kwarg:
+                    bound.add(args.kwarg.arg)
+        elif isinstance(node, ast.Lambda):
+            args = node.args
+            for a in (
+                list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+            ):
+                bound.add(a.arg)
+            if args.vararg:
+                bound.add(args.vararg.arg)
+            if args.kwarg:
+                bound.add(args.kwarg.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+    return bound
+
+
+def _format_call_error(fn_name, problem, suggestion=None):
+    msg = f"{fn_name}: {problem}"
+    if suggestion:
+        msg += f" {suggestion}"
+    return msg
+
+
+def _validate_call(node, fn_name, fn, errors):
+    """Check one call to a known SDK function against its real signature."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return
+
+    params = sig.parameters
+    valid_kw = [
+        name
+        for name, p in params.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ]
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    accepts_var_pos = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
+    )
+    required = [
+        name
+        for name, p in params.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+
+    where = f"(line {node.lineno})"
+
+    # Unknown keyword arguments (skip **kwargs spreads, which have arg=None).
+    provided_kw = set()
+    for kw in node.keywords:
+        if kw.arg is None:
+            # **something spread — can't statically resolve; give up on this call.
+            return
+        provided_kw.add(kw.arg)
+        if kw.arg not in valid_kw and not accepts_var_kw:
+            near = difflib.get_close_matches(kw.arg, valid_kw, n=1, cutoff=_SUGGEST_CUTOFF)
+            hint = f"Did you mean `{near[0]}`?" if near else (
+                f"Valid arguments: {', '.join(valid_kw) or '(none)'}."
+            )
+            errors.append(
+                _format_call_error(
+                    fn_name,
+                    f"unknown argument `{kw.arg}` {where}.",
+                    hint,
+                )
+            )
+
+    # Positional args: only meaningful if the function takes no *args. If the
+    # caller passes more positionals than there are parameters, flag it.
+    n_positional = len(node.args)
+    has_starred = any(isinstance(a, ast.Starred) for a in node.args)
+    if not accepts_var_pos and not has_starred and n_positional > len(valid_kw):
+        errors.append(
+            _format_call_error(
+                fn_name,
+                f"takes {len(valid_kw)} argument(s) but {n_positional} "
+                f"positional were given {where}.",
+            )
+        )
+
+    # Missing required arguments. Account for positionally-supplied params.
+    if not has_starred:
+        positionally_filled = set(valid_kw[:n_positional])
+        missing = [
+            name
+            for name in required
+            if name not in provided_kw and name not in positionally_filled
+        ]
+        if missing:
+            errors.append(
+                _format_call_error(
+                    fn_name,
+                    f"missing required argument(s) {', '.join('`' + m + '`' for m in missing)} {where}.",
+                )
+            )
+
+
+def _validate_user_code(code, sdk_module):
+    """Statically validate `code` against the SDK contract.
+
+    Returns ``None`` if the code passes the pre-flight checks, otherwise a
+    structured, human-readable error string describing each problem found.
+    """
+    # 1. Syntax.
+    try:
+        tree = ast.parse(code, filename="<codemcp>", mode="exec")
+    except SyntaxError as e:
+        loc = f"line {e.lineno}" + (f", col {e.offset}" if e.offset else "")
+        detail = (e.text or "").strip()
+        msg = f"SyntaxError: {e.msg} ({loc})."
+        if detail:
+            msg += f"\n    {detail}"
+        return msg
+
+    sdk_fns = _sdk_function_names(sdk_module)
+    if not sdk_fns:
+        # No SDK contract to check against; only syntax mattered.
+        return None
+
+    sdk_names = list(sdk_fns)
+    bound = _collect_bound_names(tree)
+    builtin_names = set(dir(builtins))
+
+    errors = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        name = node.func.id
+
+        if name in sdk_fns:
+            _validate_call(node, name, sdk_fns[name], errors)
+            continue
+
+        # A bare call to an unknown name. Only flag it as a typo when it is a
+        # close match to an SDK function (high-confidence). Anything that could
+        # be a local, builtin, or import is left alone.
+        if name in bound or name in builtin_names or name in _RUNTIME_INJECTED_NAMES:
+            continue
+        near = difflib.get_close_matches(name, sdk_names, n=1, cutoff=_SUGGEST_CUTOFF)
+        if near:
+            errors.append(
+                _format_call_error(
+                    name,
+                    f"is not a known SDK function (line {node.lineno}).",
+                    f"Did you mean `{near[0]}`?",
+                )
+            )
+
+    if not errors:
+        return None
+
+    header = (
+        "Pre-flight validation failed (code was not executed). "
+        "Fix these and resend:\n"
+    )
+    return header + "\n".join(f"  - {e}" for e in errors)
+
+
 def _exec_user_code(code, sdk_module, dispatcher):
     """Execute user code, returning (result, stdout, stderr, error)."""
+    # Pre-flight: reject statically-broken code before running anything, so the
+    # model gets a precise hint instead of a post-hoc traceback.
+    validation_error = _validate_user_code(code, sdk_module)
+    if validation_error is not None:
+        return None, "", "", validation_error
+
     namespace = {"__name__": "__codemcp__"}
     # Inject SDK functions directly — each returns a Pending when called.
     for name in dir(sdk_module):

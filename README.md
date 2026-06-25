@@ -555,12 +555,43 @@ and one global SDK state (an admin `enable`/`disable` affects all clients).
    `execute_python` call sends the user's code to the worker, which runs it and
    returns `{ result, stdout, stderr }`. Assign to `result` (or leave a final
    expression) to return a value.
-5. **Route SDK calls — concurrently.** Each SDK call sends its `call_tool`
+5. **Pre-flight validation.** Before running, the worker statically checks the
+   code against the live SDK contract (see below). If it doesn't pass, the call
+   returns a structured hint *without executing*, so the model fixes it in the
+   same turn instead of paying for a wasted execution round-trip.
+6. **Route SDK calls — concurrently.** Each SDK call sends its `call_tool`
    request over the control channel immediately and returns a `Pending` handle
    that resolves on first use. Calls made before any result is read are already
    in flight by the time the first value is accessed. The gateway dispatches each
    `call_tool` on its own async task so upstream round-trips overlap rather than
    serializing.
+
+### Pre-flight validation
+
+Code-mode's win — *one model turn, one tool call* — only holds when the agent
+writes correct Python the first time. A typo, a wrong keyword argument, or a
+missing required argument otherwise costs a full execution round-trip (run
+broken code → return a raw traceback → retry on a more expensive turn),
+quietly reintroducing the multi-turn loops the gateway exists to remove.
+
+So before executing, the worker statically checks the code against the **live
+SDK contract** (the real generated functions, via `inspect.signature`, so the
+check can never drift from what the model sees). It catches:
+
+- **Syntax errors** — reported with a line/column and the offending text.
+- **Misspelled SDK calls** — `github_serch_issues(...)` →
+  *"is not a known SDK function. Did you mean `github_search_issues`?"*
+- **Unknown keyword arguments** — `github_search_issues(stat="open")` →
+  *"unknown argument `stat`. Did you mean `state`?"* (or lists the valid args).
+- **Missing required arguments** — names exactly which ones are absent.
+
+If anything fails, the call returns the collected hints in the `error` field
+**without running any code**. The check is deliberately conservative: locally
+defined functions, builtins, attribute calls (`x.foo()`), `**kwargs` spreads,
+comprehensions, and imports are never flagged — only high-confidence mistakes
+against the SDK surface are. There is **zero** steady-state cost: the model's
+tool description is unchanged, and validation is invisible unless the code is
+actually broken.
 
 ### Control channel
 
